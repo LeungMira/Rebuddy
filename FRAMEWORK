@@ -1,0 +1,6 @@
+Search Tool - Search through Strict outlined sources using semantic reasoning, Target Variables = {Abstract, Title, Publishication.}
+Verification Phase - Prompt Based analysis to match the requested paper, 3 times semantic tries, if more than 1 POLAR opinion is generated, this phase is repeated one last time which then if a second failure occurs, the paper is discarded.
+Summarization - Accesses Abstract, Conclusion, and findings to represent KEY points of the paper. 
+Verification Phase - Summarizes 3 times, those 3 summarizations much match each other semantically within a given parameter of 60-90% 
+Final Output: 
+Formatted with ACM or APA citation, then Summary.
