@@ -164,7 +164,7 @@ class CrossSearch:
             is_open_access = False
             if paper["doi"]:
                 try:
-                    response = requests.get(f"https://api.unpaywall.org/v2/{paper['doi']}?email=user@example.com", timeout=5)
+                    response = requests.get(f"https://api.unpaywall.org/v2/{paper['doi']}", timeout=5)
                     if response.status_code == 200:
                         data = response.json()
                         is_open_access = data.get("is_oa", False)
