@@ -17,6 +17,12 @@ log = logging.getLogger("SearchApp")
 
 GLOBAL_PUB_DATES : list = []
 CURRENT_PAPERS   : dict = {}
+CONTACT_EMAIL    : str = ""
+
+
+def set_contact_email(email: str):
+    global CONTACT_EMAIL
+    CONTACT_EMAIL = email.strip().lower()
 
 
 # ─── Graph State ──────────────────────────────────────────────────────────────
@@ -96,15 +102,16 @@ def usability_state(state: GraphState) -> GraphState:
     transformed = state["transformed_data"]
     doi         = paper.get("DOI", "")
 
-    unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email=your@email.com" # ADD YOUR OWN GMAIL HERE
+    unpaywall_url = f"https://api.unpaywall.org/v2/{doi}"
     is_paid       = True
 
-    try:
-        resp = requests.get(unpaywall_url, timeout=5)
-        if resp.status_code == 200:
-            is_paid = not resp.json().get("is_oa", False)
-    except Exception:
-        pass
+    if CONTACT_EMAIL:
+        try:
+            resp = requests.get(unpaywall_url, params={"email": CONTACT_EMAIL}, timeout=5)
+            if resp.status_code == 200:
+                is_paid = not resp.json().get("is_oa", False)
+        except Exception:
+            pass
 
     transformed["is_paid_service"] = is_paid
 
@@ -194,19 +201,23 @@ def run_pipeline(
     retry_count     = 0
     cursor          = "*"
     batch_number    = 0
+    no_progress_batches = 0
+    max_no_progress_batches = 20
     query_embedding = engine.model.encode(sp.title)
 
     try:
-        log.debug(f"Pipeline started | title='{sp.title}' | max_papers={sp.max_papers}")
+        log.debug(f"Pipeline started | title='{sp.title}' | max_papers={sp.max_papers} | min_year={sp.min_year}")
 
         while len(CURRENT_PAPERS) < sp.max_papers:
             batch_number += 1
+            papers_before_batch = len(CURRENT_PAPERS)
             log.debug(f"--- Batch #{batch_number} | Papers so far: {len(CURRENT_PAPERS)}/{sp.max_papers} ---")
 
             if batch_callback:
                 batch_callback(batch_number)
 
-            papers, next_cursor = engine.fetch_crossref(sp.title, cursor)
+            # Pass min_year to fetch_crossref so the Crossref filter is applied
+            papers, next_cursor = engine.fetch_crossref(sp.title, cursor, min_year=sp.min_year)
 
             if not next_cursor and not papers:
                 log.warning("No papers and no next cursor. Ending search.")
@@ -234,6 +245,16 @@ def run_pipeline(
                         log.error("Could not get new cursor. Stopping.")
                         break
                     retry_count = 0
+
+                if len(CURRENT_PAPERS) == papers_before_batch:
+                    no_progress_batches += 1
+                    log.warning(
+                        f"No progress in batch #{batch_number} "
+                        f"({no_progress_batches}/{max_no_progress_batches})"
+                    )
+                    if no_progress_batches >= max_no_progress_batches:
+                        log.warning("Stopping search after too many no-progress batches.")
+                        break
                 continue
 
             retry_count = 0
@@ -258,6 +279,18 @@ def run_pipeline(
                 if len(CURRENT_PAPERS) >= sp.max_papers:
                     log.info(f"Reached max papers ({sp.max_papers}). Done.")
                     return CURRENT_PAPERS
+
+            if len(CURRENT_PAPERS) == papers_before_batch:
+                no_progress_batches += 1
+                log.warning(
+                    f"No progress in batch #{batch_number} "
+                    f"({no_progress_batches}/{max_no_progress_batches})"
+                )
+                if no_progress_batches >= max_no_progress_batches:
+                    log.warning("Stopping search after too many no-progress batches.")
+                    break
+            else:
+                no_progress_batches = 0
 
         log.info(f"Pipeline complete. Total papers: {len(CURRENT_PAPERS)}")
 
