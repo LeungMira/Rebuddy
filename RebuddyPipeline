@@ -1,0 +1,269 @@
+# ─── Imports ──────────────────────────────────────────────────────────────────
+import requests
+import logging
+from typing import TypedDict, Any, Dict
+
+from langgraph.graph         import StateGraph, START, END
+from sentence_transformers   import util
+
+import Rebuddy as rb
+
+
+# ─── Logger ───────────────────────────────────────────────────────────────────
+log = logging.getLogger("SearchApp")
+
+
+# ─── Global State ─────────────────────────────────────────────────────────────
+
+GLOBAL_PUB_DATES : list = []
+CURRENT_PAPERS   : dict = {}
+
+
+# ─── Graph State ──────────────────────────────────────────────────────────────
+
+class GraphState(TypedDict):
+    sp              : Any
+    paper           : Dict[str, Any]
+    query_embedding : Any
+    model           : Any
+    is_valid        : bool
+    transformed_data: Dict[str, Any]
+    output_msg      : str
+
+
+# ─── Nodes ────────────────────────────────────────────────────────────────────
+
+def verify_state(state: GraphState) -> GraphState:
+    paper     = state["paper"]
+    sp        = state["sp"]
+    query_emb = state["query_embedding"]
+    model     = state["model"]
+
+    state["is_valid"] = False
+    doi = paper.get("DOI", "")
+
+    if not doi:
+        return state
+
+    if sp.doi_prefixes:
+        prefix_match = any(prefix and doi.startswith(prefix) for prefix in sp.doi_prefixes)
+        if not prefix_match:
+            return state
+
+    title_list  = paper.get("title", [""])
+    paper_title = title_list[0] if title_list else ""
+
+    if not paper_title:
+        return state
+
+    sim_score = util.cos_sim(query_emb, model.encode(paper_title)).item()
+
+    if sim_score > 0.50:
+        state["is_valid"] = True
+
+    return state
+
+
+def transform_state(state: GraphState) -> GraphState:
+    paper     = state["paper"]
+    sp        = state["sp"]
+    model     = state["model"]
+    query_emb = state["query_embedding"]
+
+    transformed                    = {}
+    transformed["search_title"]    = sp.title
+    transformed["paper_title"]     = paper.get("title", [""])[0]
+
+    abstract = paper.get("abstract", "")
+    if abstract:
+        transformed["abstract_similarity"] = util.cos_sim(query_emb, model.encode(abstract)).item()
+    else:
+        transformed["abstract_similarity"] = 0.0
+
+    pub_date                       = paper.get("created", {}).get("date-time", "Unknown Date")
+    transformed["publication_date"] = pub_date
+
+    global GLOBAL_PUB_DATES
+    GLOBAL_PUB_DATES.append(pub_date)
+
+    state["transformed_data"] = transformed
+    return state
+
+
+def usability_state(state: GraphState) -> GraphState:
+    paper       = state["paper"]
+    sp          = state["sp"]
+    transformed = state["transformed_data"]
+    doi         = paper.get("DOI", "")
+
+    unpaywall_url = f"https://api.unpaywall.org/v2/{doi}?email=your@email.com" # ADD YOUR OWN GMAIL HERE
+    is_paid       = True
+
+    try:
+        resp = requests.get(unpaywall_url, timeout=5)
+        if resp.status_code == 200:
+            is_paid = not resp.json().get("is_oa", False)
+    except Exception:
+        pass
+
+    transformed["is_paid_service"] = is_paid
+
+    global CURRENT_PAPERS
+    CURRENT_PAPERS[doi] = transformed
+
+    state["output_msg"] = f"{sp.title}_{len(CURRENT_PAPERS)}"
+    return state
+
+
+# ─── Router ───────────────────────────────────────────────────────────────────
+
+def route_after_verify(state: GraphState) -> str:
+    return "transform_state" if state["is_valid"] else END
+
+
+# ─── Export Node ───────────────────────────────────────────────────────────────────
+
+def export_state(state: GraphState) -> GraphState:
+    """
+    Final Step — Export
+    Serializes CURRENT_PAPERS to a JSON file labelled SpTITLE_SPMAX.
+    File name: {sp.title}_{sp.max_papers}.json  (spaces replaced with underscores).
+    """
+    import json
+
+    sp         = state["sp"]
+    file_label = f"{sp.title}_{sp.max_papers}".replace(" ", "_")
+    file_name  = f"{file_label}.json"
+
+    try:
+        with open(file_name, "w", encoding="utf-8") as f:
+            json.dump(CURRENT_PAPERS, f, indent=4, ensure_ascii=False)
+        log.info(f"[Export] Saved '{file_name}' ({len(CURRENT_PAPERS)} papers)")
+    except Exception as e:
+        log.error(f"[Export] Failed to write '{file_name}': {e}")
+
+    state["output_msg"] = file_label
+    return state
+
+
+# ─── Graph Assembly ────────────────────────────────────────────────────────────
+
+def build_paper_evaluation_graph():
+    workflow = StateGraph(GraphState)
+
+    workflow.add_node("verify_state",    verify_state)
+    workflow.add_node("transform_state", transform_state)
+    workflow.add_node("usability_state", usability_state)
+    workflow.add_node("export_state",    export_state)
+
+    workflow.add_edge(START, "verify_state")
+    workflow.add_conditional_edges("verify_state", route_after_verify)
+    workflow.add_edge("transform_state", "usability_state")
+    workflow.add_edge("usability_state", "export_state")
+    workflow.add_edge("export_state",    END)
+
+    return workflow.compile()
+
+
+# ─── Pipeline API (called by the GUI) ─────────────────────────────────────────
+
+def preload_engine() -> rb.SearchEngine:
+    """Creates a SearchEngine and loads the model. Run this off the main thread."""
+    engine = rb.SearchEngine()
+    engine.load_model()
+    return engine
+
+
+def run_pipeline(
+    engine           : rb.SearchEngine,
+    sp               : rb.SearchParameterization,
+    progress_callback= None,
+    batch_callback   = None,
+    error_callback   = None
+) -> dict:
+    """
+    Orchestrates the full search + per-paper LangGraph evaluation.
+    Replaces process_search — called from the GUI's background thread.
+    Returns the final CURRENT_PAPERS dict.
+    """
+    global CURRENT_PAPERS, GLOBAL_PUB_DATES
+    CURRENT_PAPERS   = {}
+    GLOBAL_PUB_DATES = []
+
+    graph           = build_paper_evaluation_graph()
+    retry_count     = 0
+    cursor          = "*"
+    batch_number    = 0
+    query_embedding = engine.model.encode(sp.title)
+
+    try:
+        log.debug(f"Pipeline started | title='{sp.title}' | max_papers={sp.max_papers}")
+
+        while len(CURRENT_PAPERS) < sp.max_papers:
+            batch_number += 1
+            log.debug(f"--- Batch #{batch_number} | Papers so far: {len(CURRENT_PAPERS)}/{sp.max_papers} ---")
+
+            if batch_callback:
+                batch_callback(batch_number)
+
+            papers, next_cursor = engine.fetch_crossref(sp.title, cursor)
+
+            if not next_cursor and not papers:
+                log.warning("No papers and no next cursor. Ending search.")
+                break
+
+            if next_cursor:
+                cursor = next_cursor
+
+            if not papers:
+                log.warning(f"Batch #{batch_number} returned 0 papers. Stopping.")
+                break
+
+            duplicate_count = sum(1 for p in papers if p.get("DOI") in CURRENT_PAPERS)
+            duplicate_ratio = duplicate_count / len(papers)
+            log.debug(f"Batch #{batch_number} | Duplicates: {duplicate_count}/{len(papers)} ({duplicate_ratio:.0%})")
+
+            if duplicate_ratio >= 0.50:
+                retry_count += 1
+                log.warning(f"High duplicate ratio | retry_count={retry_count}")
+                if retry_count >= 3:
+                    new_cursor = engine.get_new_cursor(sp.title)
+                    if new_cursor:
+                        cursor = new_cursor
+                    else:
+                        log.error("Could not get new cursor. Stopping.")
+                        break
+                    retry_count = 0
+                continue
+
+            retry_count = 0
+
+            for paper in papers:
+                if paper.get("DOI") in CURRENT_PAPERS:
+                    continue
+
+                graph.invoke({
+                    "sp"              : sp,
+                    "paper"           : paper,
+                    "query_embedding" : query_embedding,
+                    "model"           : engine.model,
+                    "is_valid"        : False,
+                    "transformed_data": {},
+                    "output_msg"      : ""
+                })
+
+                if progress_callback:
+                    progress_callback(len(CURRENT_PAPERS), sp.max_papers)
+
+                if len(CURRENT_PAPERS) >= sp.max_papers:
+                    log.info(f"Reached max papers ({sp.max_papers}). Done.")
+                    return CURRENT_PAPERS
+
+        log.info(f"Pipeline complete. Total papers: {len(CURRENT_PAPERS)}")
+
+    except Exception as e:
+        log.exception(f"Pipeline error: {e}")
+        if error_callback:
+            error_callback(str(e))
+
+    return CURRENT_PAPERS
